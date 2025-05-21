@@ -15,7 +15,7 @@ A empresa XPTO está em processo de transformação digital e deseja migrar para
 
 - [Arquitetura da Solução](arquitetura.md) - Visão geral e justificativas de design
 - [Diagrama de Topologia](topologia.md) - Diagrama detalhado da infraestrutura
-- [Dimensionamento de Recursos](./docs/dimensionamento.md) - Especificações técnicas de hardware e capacidade
+- [Dimensionamento de Recursos](dimensionamento.md) - Especificações técnicas de hardware e capacidade
 - [Estratégia FinOps](./docs/finops.md) - Abordagem para otimização de custos
 - [Infrastructure as Code](./infra) - Código Terraform e Ansible para automação
 - [Plano de Disaster Recovery](./docs/dr.md) - Estratégias de recuperação e continuidade
