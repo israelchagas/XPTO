@@ -13,7 +13,7 @@ A empresa XPTO está em processo de transformação digital e deseja migrar para
 
 ## Conteúdo do Repositório
 
-- [Arquitetura da Solução](./docs/arquitetura.md) - Visão geral e justificativas de design
+- [Arquitetura da Solução](arquitetura.md) - Visão geral e justificativas de design
 - [Diagrama de Topologia](./docs/topologia.md) - Diagrama detalhado da infraestrutura
 - [Dimensionamento de Recursos](./docs/dimensionamento.md) - Especificações técnicas de hardware e capacidade
 - [Estratégia FinOps](./docs/finops.md) - Abordagem para otimização de custos
