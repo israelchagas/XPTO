@@ -1,0 +1,300 @@
+# main.tf - Infraestrutura Principal
+# Terraform para provisionamento da infraestrutura híbrida XPTO Fluxo de Caixa
+
+# Providers
+provider "aws" {
+  region = var.aws_region
+  default_tags {
+    tags = {
+      Environment = var.environment
+      Project     = "xpto-fluxo-caixa"
+      ManagedBy   = "terraform"
+    }
+  }
+}
+
+# VPC e Networking
+module "vpc" {
+  source = "./modules/vpc"
+
+  vpc_name            = "xpto-${var.environment}"
+  vpc_cidr            = var.vpc_cidr
+  azs                 = var.availability_zones
+  private_subnets     = var.private_subnets
+  public_subnets      = var.public_subnets
+  database_subnets    = var.database_subnets
+  enable_nat_gateway  = true
+  single_nat_gateway  = var.environment == "production" ? false : true
+  enable_vpn_gateway  = true
+  
+  # Enable VPN connection to on-premises
+  vpn_gateway_id      = aws_vpn_gateway.main.id
+  customer_gateway_id = aws_customer_gateway.main.id
+  
+  tags = local.common_tags
+}
+
+# VPN Connection to On-Premises
+resource "aws_customer_gateway" "main" {
+  bgp_asn    = 65000
+  ip_address = var.onprem_vpn_ip
+  type       = "ipsec.1"
+  
+  tags = merge(
+    local.common_tags,
+    {
+      Name = "xpto-onprem-gateway"
+    }
+  )
+}
+
+resource "aws_vpn_gateway" "main" {
+  vpc_id = module.vpc.vpc_id
+  
+  tags = merge(
+    local.common_tags,
+    {
+      Name = "xpto-vpn-gateway"
+    }
+  )
+}
+
+resource "aws_vpn_connection" "main" {
+  vpn_gateway_id      = aws_vpn_gateway.main.id
+  customer_gateway_id = aws_customer_gateway.main.id
+  type                = "ipsec.1"
+  static_routes_only  = false
+  
+  # Define IPSEC tunnel options
+  tunnel1_inside_cidr   = var.tunnel1_inside_cidr
+  tunnel2_inside_cidr   = var.tunnel2_inside_cidr
+  tunnel1_preshared_key = var.tunnel1_preshared_key
+  tunnel2_preshared_key = var.tunnel2_preshared_key
+  
+  tags = merge(
+    local.common_tags,
+    {
+      Name = "xpto-vpn-connection"
+    }
+  )
+}
+
+# EKS Cluster
+module "eks" {
+  source = "./modules/eks"
+  
+  cluster_name    = "xpto-${var.environment}"
+  cluster_version = var.eks_cluster_version
+  
+  vpc_id          = module.vpc.vpc_id
+  subnet_ids      = module.vpc.private_subnets
+  
+  # Node Groups
+  node_groups = {
+    lancamentos = {
+      desired_capacity = 3
+      max_capacity     = 10
+      min_capacity     = 3
+      instance_types   = ["m5.large"]
+      disk_size        = 50
+      labels = {
+        service = "lancamentos"
+      }
+      taints = []
+    },
+    consolidado = {
+      desired_capacity = 5
+      max_capacity     = 15
+      min_capacity     = 3
+      instance_types   = ["c5.xlarge"]
+      disk_size        = 50
+      labels = {
+        service = "consolidado"
+      }
+      taints = []
+    },
+    spot_workers = {
+      desired_capacity = 3
+      max_capacity     = 10
+      min_capacity     = 1
+      instance_types   = ["m5.large", "m4.large", "m5a.large"]
+      disk_size        = 50
+      capacity_type    = "SPOT"
+      labels = {
+        workload_type = "non-critical"
+      }
+    }
+  }
+  
+  # IAM and RBAC
+  manage_aws_auth = true
+  
+  tags = local.common_tags
+}
+
+# RDS PostgreSQL (Cloud Database)
+module "rds" {
+  source = "./modules/rds"
+  
+  identifier        = "xpto-${var.environment}-postgres"
+  engine            = "postgres"
+  engine_version    = "14.5"
+  instance_class    = var.environment == "production" ? "db.m5.large" : "db.t3.medium"
+  allocated_storage = 100
+  storage_encrypted = true
+  
+  name     = "fluxocaixa"
+  username = var.db_username
+  password = var.db_password
+  port     = 5432
+  
+  vpc_security_group_ids = [module.security_groups.database_sg_id]
+  subnet_ids             = module.vpc.database_subnets
+  multi_az               = var.environment == "production" ? true : false
+  
+  backup_retention_period = 30
+  backup_window           = "03:00-04:00"
+  maintenance_window      = "sun:04:30-sun:05:30"
+  
+  deletion_protection = true
+  skip_final_snapshot = false
+  
+  tags = local.common_tags
+}
+
+# ElastiCache Redis (Cache Distribuído)
+module "elasticache" {
+  source = "./modules/elasticache"
+  
+  cluster_id      = "xpto-${var.environment}-redis"
+  engine          = "redis"
+  engine_version  = "6.x"
+  node_type       = var.environment == "production" ? "cache.m5.large" : "cache.t3.medium"
+  num_cache_nodes = 3
+  
+  subnet_group_name          = aws_elasticache_subnet_group.redis.name
+  security_group_ids         = [module.security_groups.redis_sg_id]
+  
+  parameter_group_name       = "default.redis6.x.cluster.on"
+  
+  maintenance_window         = "sun:05:00-sun:06:00"
+  snapshot_retention_limit   = 7
+  snapshot_window            = "00:00-01:00"
+  automatic_failover_enabled = true
+  
+  tags = local.common_tags
+}
+
+resource "aws_elasticache_subnet_group" "redis" {
+  name       = "xpto-${var.environment}-redis-subnet-group"
+  subnet_ids = module.vpc.private_subnets
+  
+  tags = local.common_tags
+}
+
+# Security Groups
+module "security_groups" {
+  source = "./modules/security_groups"
+  
+  vpc_id        = module.vpc.vpc_id
+  vpc_cidr      = var.vpc_cidr
+  onprem_cidr   = var.onprem_cidr
+  
+  tags = local.common_tags
+}
+
+# S3 Buckets for Backups and Objects
+module "s3" {
+  source = "./modules/s3"
+  
+  backup_bucket_name   = "xpto-${var.environment}-backups"
+  logs_bucket_name     = "xpto-${var.environment}-logs"
+  
+  versioning           = true
+  lifecycle_rules      = true
+  
+  tags = local.common_tags
+}
+
+# CloudWatch Alarms and Dashboards
+module "monitoring" {
+  source = "./modules/monitoring"
+  
+  environment           = var.environment
+  rds_instance_id       = module.rds.instance_id
+  elasticache_cluster_id = module.elasticache.cluster_id
+  eks_cluster_name      = module.eks.cluster_name
+  
+  alarm_sns_topic       = aws_sns_topic.alarms.arn
+  
+  tags = local.common_tags
+}
+
+# SNS Topic for Alarms
+resource "aws_sns_topic" "alarms" {
+  name = "xpto-${var.environment}-alarms"
+  
+  tags = local.common_tags
+}
+
+# KMS Keys for Encryption
+module "kms" {
+  source = "./modules/kms"
+  
+  environment    = var.environment
+  admin_arns     = var.kms_admin_arns
+  
+  tags = local.common_tags
+}
+
+# Route53 DNS
+module "dns" {
+  source = "./modules/dns"
+  
+  domain_name         = var.domain_name
+  environment         = var.environment
+  vpc_id              = module.vpc.vpc_id
+  
+  tags = local.common_tags
+}
+
+# Locals
+locals {
+  common_tags = {
+    Environment = var.environment
+    Project     = "xpto-fluxo-caixa"
+    Owner       = "infrastructure-team"
+    CostCenter  = "finance"
+  }
+}
+
+# Outputs
+output "eks_cluster_endpoint" {
+  description = "Endpoint for EKS control plane"
+  value       = module.eks.cluster_endpoint
+}
+
+output "eks_cluster_security_group_id" {
+  description = "Security group ID attached to the EKS cluster"
+  value       = module.eks.cluster_security_group_id
+}
+
+output "eks_cluster_name" {
+  description = "Kubernetes Cluster Name"
+  value       = module.eks.cluster_name
+}
+
+output "rds_endpoint" {
+  description = "RDS instance endpoint"
+  value       = module.rds.instance_endpoint
+}
+
+output "elasticache_endpoint" {
+  description = "ElastiCache cluster endpoint"
+  value       = module.elasticache.cluster_endpoint
+}
+
+output "vpn_connection_id" {
+  description = "The ID of the VPN Connection"
+  value       = aws_vpn_connection.main.id
+}

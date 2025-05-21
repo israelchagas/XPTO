@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consolidado
+  namespace: financial
+  labels:
+    app: consolidado
+    service: fluxo-caixa
+    version: v1
+    environment: production
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: consolidado
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: consolidado
+        service: fluxo-caixa
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port

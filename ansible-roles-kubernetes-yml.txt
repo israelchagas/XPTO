@@ -1,0 +1,221 @@
+---
+# Configuração do Kubernetes para nós on-premises
+
+- name: Adicionar repositório Kubernetes
+  apt_repository:
+    repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+    state: present
+    filename: kubernetes
+    update_cache: yes
+  register: apt_k8s_repo
+  retries: 5
+  delay: 10
+  until: apt_k8s_repo is success
+
+- name: Instalar pacotes necessários para o Kubernetes
+  apt:
+    name: "{{ packages }}"
+    state: present
+    update_cache: yes
+  vars:
+    packages:
+      - kubelet={{ k8s_version }}-00
+      - kubeadm={{ k8s_version }}-00
+      - kubectl={{ k8s_version }}-00
+  register: apt_install_k8s
+  retries: 5
+  delay: 10
+  until: apt_install_k8s is success
+
+- name: Fixar versão dos pacotes Kubernetes
+  dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+
+- name: Desativar swap
+  command: swapoff -a
+  when: ansible_swaptotal_mb > 0
+
+- name: Remover swap do fstab
+  lineinfile:
+    path: /etc/fstab
+    regexp: '\sswap\s'
+    state: absent
+
+- name: Configurar módulos do kernel necessários
+  lineinfile:
+    path: /etc/modules-load.d/k8s.conf
+    line: "{{ item }}"
+    create: yes
+  loop:
+    - overlay
+    - br_netfilter
+
+- name: Carregar módulos do kernel
+  modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
+
+- name: Configurar parâmetros sysctl para Kubernetes
+  sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: yes
+  loop:
+    - { key: "net.bridge.bridge-nf-call-iptables", value: "1" }
+    - { key: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+    - { key: "net.ipv4.ip_forward", value: "1" }
+
+- name: Configurar containerd
+  include_tasks: containerd.yml
+  when: container_runtime == "containerd"
+
+# Tarefas específicas para nós de controle (masters)
+- name: Inicializar o cluster Kubernetes (somente no primeiro control-plane)
+  command: >
+    kubeadm init
+    --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+    --apiserver-cert-extra-sans={{ control_plane_endpoint }}
+    --control-plane-endpoint={{ control_plane_endpoint }}
+    --pod-network-cidr={{ pod_network_cidr }}
+    --service-cidr=10.96.0.0/12
+    --upload-certs
+    --v=5
+  args:
+    creates: /etc/kubernetes/admin.conf
+  register: kubeadm_init
+  when: inventory_hostname == groups['k8s_control_plane'][0]
+
+- name: Criar diretório .kube para usuário root
+  file:
+    path: /root/.kube
+    state: directory
+    mode: '0755'
+  when: inventory_hostname in groups['k8s_control_plane']
+
+- name: Copiar arquivo de configuração do Kubernetes para usuário root
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/.kube/config
+    remote_src: yes
+    mode: '0600'
+  when: inventory_hostname in groups['k8s_control_plane']
+
+- name: Obter token e hash para junção ao cluster
+  shell: |
+    set -o pipefail
+    kubeadm token create --print-join-command
+  args:
+    executable: /bin/bash
+  register: kubeadm_join_command
+  when: inventory_hostname == groups['k8s_control_plane'][0]
+
+- name: Juntar outros control-planes ao cluster
+  command: "{{ hostvars[groups['k8s_control_plane'][0]]['kubeadm_join_command'].stdout }} --control-plane --certificate-key {{ kubeadm_init.stdout_lines | regex_search('--certificate-key ([^ ]+)') | regex_replace('--certificate-key ', '') }}"
+  args:
+    creates: /etc/kubernetes/kubelet.conf
+  when: inventory_hostname in groups['k8s_control_plane'] and inventory_hostname != groups['k8s_control_plane'][0]
+
+- name: Juntar workers ao cluster
+  command: "{{ hostvars[groups['k8s_control_plane'][0]]['kubeadm_join_command'].stdout }}"
+  args:
+    creates: /etc/kubernetes/kubelet.conf
+  when: inventory_hostname in groups['k8s_workers']
+
+- name: Instalar rede Calico (somente no primeiro control-plane)
+  shell: |
+    kubectl apply -f https://docs.projectcalico.org/v3.24/manifests/calico.yaml
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == groups['k8s_control_plane'][0]
+
+- name: Instalar MetalLB para Load Balancer (somente no primeiro control-plane)
+  shell: |
+    kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.7/config/manifests/metallb-native.yaml
+    cat <<EOF | kubectl apply -f -
+    apiVersion: metallb.io/v1beta1
+    kind: IPAddressPool
+    metadata:
+      name: first-pool
+      namespace: metallb-system
+    spec:
+      addresses:
+      - 10.0.2.100-10.0.2.200
+    EOF
+    cat <<EOF | kubectl apply -f -
+    apiVersion: metallb.io/v1beta1
+    kind: L2Advertisement
+    metadata:
+      name: l2-advert
+      namespace: metallb-system
+    spec:
+      ipAddressPools:
+      - first-pool
+    EOF
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == groups['k8s_control_plane'][0]
+
+- name: Instalar Kubernetes Dashboard (somente no primeiro control-plane)
+  shell: |
+    kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.7.0/aio/deploy/recommended.yaml
+    cat <<EOF | kubectl apply -f -
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: admin-user
+      namespace: kubernetes-dashboard
+    EOF
+    cat <<EOF | kubectl apply -f -
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: admin-user
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: ClusterRole
+      name: cluster-admin
+    subjects:
+    - kind: ServiceAccount
+      name: admin-user
+      namespace: kubernetes-dashboard
+    EOF
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == groups['k8s_control_plane'][0] and enable_dashboard
+
+- name: Instalar Metrics Server para monitoramento (somente no primeiro control-plane)
+  shell: |
+    kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == groups['k8s_control_plane'][0]
+
+- name: Verificar status dos nós (somente no primeiro control-plane)
+  shell: |
+    kubectl get nodes -o wide
+  args:
+    executable: /bin/bash
+  register: nodes_status
+  when: inventory_hostname == groups['k8s_control_plane'][0]
+
+- name: Mostrar status dos nós
+  debug:
+    var: nodes_status.stdout_lines
+  when: inventory_hostname == groups['k8s_control_plane'][0]
+
+- name: Configurar kubeconfig para acessar cluster
+  template:
+    src: kubeconfig.j2
+    dest: /tmp/kubeconfig.yaml
+    mode: '0600'
+  delegate_to: localhost
+  when: inventory_hostname == groups['k8s_control_plane'][0]

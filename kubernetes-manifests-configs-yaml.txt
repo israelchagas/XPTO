@@ -1,0 +1,212 @@
+# ConfigMaps para ambiente de produção
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: financial
+  labels:
+    name: financial
+    environment: production
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: database-config
+  namespace: financial
+data:
+  # Ambiente híbrido: DB primário on-prem com réplica na cloud
+  db_host_onprem: "postgres-master.xpto.internal"
+  db_host_cloud: "xpto-production-postgres.rds.amazonaws.com"
+  db_host: "postgres-master.xpto.internal" # Host principal
+  db_port: "5432"
+  db_name: "fluxocaixa"
+  connection_pool_size: "50"
+  connection_timeout: "30000"
+  max_pool_size: "100"
+  idle_timeout: "600000"
+  max_lifetime: "1800000"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: financial
+data:
+  redis_host_onprem: "redis-cluster.xpto.internal"
+  redis_host_cloud: "xpto-production-redis.elasticache.amazonaws.com"
+  redis_host: "redis-cluster.xpto.internal" # Host principal
+  redis_port: "6379"
+  redis_ttl: "3600" # 1 hora em segundos
+  redis_max_connections: "100"
+  redis_connection_timeout: "2000"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-config
+  namespace: financial
+data:
+  bootstrap_servers: "kafka-1.xpto.internal:9092,kafka-2.xpto.internal:9092,kafka-3.xpto.internal:9092"
+  acks: "all"
+  retries: "3"
+  batch_size: "16384"
+  linger_ms: "10"
+  buffer_memory: "33554432"
+  auto_commit_interval_ms: "5000"
+  auto_offset_reset: "earliest"
+  group_id: "fluxocaixa-group"
+  enable_auto_commit: "true"
+  topics_lancamentos: "lancamentos-events"
+  topics_consolidacao: "consolidacao-events"
+  topics_backup: "backup-events"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: application-config
+  namespace: financial
+data:
+  logging_level: "INFO"
+  logging_pattern: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+  logging_file_path: "/app/logs"
+  logging_file_name: "application.log"
+  logging_max_size: "100MB"
+  logging_max_history: "30"
+  logging_total_size_cap: "3GB"
+  
+  # Configurações de aplicação
+  default_page_size: "50"
+  max_page_size: "1000"
+  api_rate_limit: "1000" # requisições por minuto
+  api_rate_limit_period: "60" # segundos
+  
+  # Configurações de circuit breaker
+  circuit_breaker_failure_rate_threshold: "50"
+  circuit_breaker_wait_duration_in_open_state: "10000" # 10 segundos
+  circuit_breaker_ring_buffer_size_in_half_open_state: "10"
+  circuit_breaker_ring_buffer_size_in_closed_state: "100"
+  
+  # Configurações de timeout
+  connection_timeout: "5000" # 5 segundos
+  read_timeout: "30000" # 30 segundos
+  write_timeout: "30000" # 30 segundos
+  
+  # Configurações de arquivos de processamento
+  temp_dir: "/tmp"
+  max_file_size: "50MB"
+  max_request_size: "75MB"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database-credentials
+  namespace: financial
+type: Opaque
+data:
+  # Valores em Base64 (substituir em ambiente real)
+  username: eHB0b191c2Vy # xpto_user
+  password: U3VwZXJTM2N1cmVQQHNzdzByZA== # SuperS3curePa@ssw0rd
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-credentials
+  namespace: financial
+type: Opaque
+data:
+  # Valores em Base64 (substituir em ambiente real)
+  password: UjNkaXNQQHNzdzByZDEyMzQ= # R3disPa@ssw0rd1234
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ssl-certificates
+  namespace: financial
+type: Opaque
+data:
+  # Valores em Base64 (substituir em ambiente real)
+  keystore.p12: base64EncodedKeystore==
+  truststore.p12: base64EncodedTruststore==
+  keystore_password: a2V5c3RvcmVwYXNz # keystorepass
+  truststore_password: dHJ1c3RzdG9yZXBhc3M= # truststorepass
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: financial-quota
+  namespace: financial
+spec:
+  hard:
+    pods: "50"
+    requests.cpu: "40"
+    requests.memory: 80Gi
+    limits.cpu: "80"
+    limits.memory: 160Gi
+    persistentvolumeclaims: "20"
+    services: "30"
+    services.loadbalancers: "5"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: financial-limits
+  namespace: financial
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: 500m
+      memory: 512Mi
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    max:
+      cpu: "4"
+      memory: 8Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: financial-network-policy
+  namespace: financial
+spec:
+  podSelector:
+    matchLabels:
+      service: fluxo-caixa
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    - podSelector:
+        matchLabels:
+          service: fluxo-caixa
+    ports:
+    - protocol: TCP
+      port: 8080
+    - protocol: TCP
+      port: 9090
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    - podSelector:
+        matchLabels:
+          service: fluxo-caixa
+    - ipBlock:
+        cidr: 10.0.0.0/8  # Rede on-premises
+    - ipBlock:
+        cidr: 172.16.0.0/12  # Rede cloud (VPC)
+    ports:
+    - protocol: TCP
+      port: 5432  # PostgreSQL
+    - protocol: TCP
+      port: 6379  # Redis
+    - protocol: TCP
+      port: 9092  # Kafka
